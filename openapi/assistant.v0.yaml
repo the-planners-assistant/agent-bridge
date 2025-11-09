@@ -1,0 +1,631 @@
+openapi: 3.0.3
+info:
+  title: Planning Assistant Bridge API
+  version: 0.0.2
+  description: |
+    Versioned agent-bridge for BOPS & Local Plan clients.
+    Public JSON/GeoJSON is EPSG:4326 (WGS84). Internal PostGIS may use EPSG:27700.
+    Streaming via Server-Sent Events (SSE). GeoJSON overlays are first-class.
+
+servers:
+  - url: https://api.planning-assistant.local/v1
+    description: v1 base
+
+tags:
+  - name: Meta
+  - name: Runs
+  - name: Reports
+  - name: Registries
+  - name: Tools
+  - name: Health
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: OK
+
+  /meta:
+    get:
+      tags: [Meta]
+      summary: API and capability metadata
+      responses:
+        '200':
+          description: API metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_version: { type: string, example: "1.0.0" }
+                  schemas: { type: array, items: { type: string }, example: ["tpa.run/0.2","tpa.run/0.3"] }
+                  constraints_layers: { type: array, items: { type: string } }
+                  policy_scopes: { type: array, items: { type: string } }
+                  report_templates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        fields: { type: array, items: { type: string } }
+                  crs_policy:
+                    type: object
+                    properties:
+                      input: { type: string, example: EPSG:4326 }
+                      internal: { type: string, example: EPSG:27700 }
+                      output: { type: string, example: EPSG:4326 }
+                  supports_vlm: { type: boolean }
+                  available_models: { type: array, items: { type: string } }
+                  limits:
+                    type: object
+                    properties:
+                      max_doc_bytes: { type: integer }
+                      max_geom_vertices: { type: integer }
+
+  /runs:
+    post:
+      tags: [Runs]
+      summary: Start an assessment run (asynchronous)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/XClient'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssessmentEnvelope' }
+      responses:
+        '202':
+          description: Run accepted
+          headers:
+            X-Run-Id: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { type: string }
+                  status: { type: string, enum: [queued, running, completed, failed] }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /runs/{run_id}:
+    get:
+      tags: [Runs]
+      summary: Retrieve latest result snapshot for a run
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Latest AssessmentResult snapshot
+          headers:
+            ETag: { schema: { type: string } }
+            X-Model-Ref: { schema: { type: string } }
+            X-KB-Snapshot: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssessmentResult' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /runs/{run_id}/events:
+    get:
+      tags: [Runs]
+      summary: Stream run events (SSE)
+      description: |
+        Server-Sent Events stream of progress/update/overlay/patch/done/error frames.
+        Content-Type: text/event-stream
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: text/event-stream
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /runs/{run_id}/overlays.geojson:
+    get:
+      tags: [Runs]
+      summary: GeoJSON overlays for map rendering
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - in: query
+          name: layers
+          description: Optional comma-separated layer filter
+          required: false
+          schema: { type: string, example: "conservation,flood_zones,ai_inferences" }
+      responses:
+        '200':
+          description: GeoJSON FeatureCollection
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/geo+json:
+              schema:
+                type: object
+        '404': { $ref: '#/components/responses/Problem' }
+
+  # Synchronous convenience (wrap /runs and wait)
+  /assess:
+    post:
+      tags: [Runs]
+      summary: Synchronous assessment (convenience)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/XClient'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssessmentEnvelope' }
+      responses:
+        '200':
+          description: Final result
+          headers:
+            X-Run-Id: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssessmentResult' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+
+  /validate:
+    post:
+      tags: [Runs]
+      summary: Validate envelope (optionally scoped)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/XClient'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/AssessmentEnvelope'
+                - type: object
+                  properties:
+                    validate_scope:
+                      type: array
+                      items: { type: string, enum: [geometry, documents, policy_scope, constraints_layers, goals] }
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        path: { type: string }
+                        message: { type: string }
+        '400': { $ref: '#/components/responses/Problem' }
+
+  /notice:
+    post:
+      tags: [Runs]
+      summary: Generate notice text from a result (convenience)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/XClient'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssessmentEnvelope' }
+      responses:
+        '200':
+          description: Result with notice-ready content
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssessmentResult' }
+
+  /reports:
+    post:
+      tags: [Reports]
+      summary: Create/update a report draft from fields
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [template_id, fields]
+              properties:
+                template_id: { type: string }
+                fields: { type: object, additionalProperties: { type: string } }
+                provenance:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvidenceLink' }
+      responses:
+        '201':
+          description: Report draft created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report_draft_id: { type: string }
+
+  /reports/{report_draft_id}:
+    get:
+      tags: [Reports]
+      summary: Get report draft
+      parameters:
+        - in: path
+          name: report_draft_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Draft
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  template_id: { type: string }
+                  fields: { type: object, additionalProperties: { type: string } }
+                  provenance:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items: { $ref: '#/components/schemas/EvidenceLink' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /reports/{report_draft_id}/export:
+    get:
+      tags: [Reports]
+      summary: Export report draft
+      parameters:
+        - in: path
+          name: report_draft_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: format
+          required: true
+          schema: { type: string, enum: [docx, pdf, md] }
+      responses:
+        '200':
+          description: Binary export
+          content:
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document: {}
+            application/pdf: {}
+            text/markdown: {}
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /registries/{name}:
+    get:
+      tags: [Registries]
+      summary: Fetch a registry (constraints, policy_scopes, report_templates)
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string, enum: [constraints, policy_scopes, report_templates] }
+      responses:
+        '200':
+          description: Registry payload
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: string }
+                  - type: array
+                    items:
+                      type: object
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /tools/execute:
+    post:
+      tags: [Tools]
+      summary: Execute a named tool against a subject
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, subject]
+              properties:
+                name: { type: string, example: extract_ridge_height }
+                subject:
+                  type: object
+                  properties:
+                    run_id: { type: string }
+                    case_id: { type: string }
+                args: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Tool result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { type: object }
+                  overlay_uri: { type: string }
+        '400': { $ref: '#/components/responses/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    RunId:
+      in: path
+      name: run_id
+      required: true
+      schema: { type: string }
+    XClient:
+      in: header
+      name: X-Client
+      required: true
+      schema: { type: string, enum: [bops, local-plan] }
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Problem:
+      description: RFC7807 problem response
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            properties:
+              type: { type: string, example: about:blank }
+              title: { type: string }
+              status: { type: integer }
+              detail: { type: string }
+              instance: { type: string }
+
+  schemas:
+    EvidenceLink:
+      type: object
+      required: [id, kind, source_type, uri, pointer, hash, captured_at]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        source_type: { type: string, enum: [document, policy, spatial, manual] }
+        uri: { type: string, format: uri }
+        pointer:
+          type: string
+          description: pdf:page=12#para=3 | geo:layer=flood_zones#fid=123 | policy:id=LP12#para=3 | manual:ref
+          pattern: '^(pdf:page=\d+(#para=\d+)?)|(geo:layer=[A-Za-z0-9_\-]+#fid=[A-Za-z0-9_\-]+)|(policy:id=[A-Za-z0-9_\-]+(#para=\d+)?)|(manual:[A-Za-z0-9_\-\.]+)$'
+        hash: { type: string, description: sha256 hex of canonical source }
+        hash_algo: { type: string, enum: [sha256], default: sha256 }
+        captured_at: { type: string, format: date-time }
+        snippet: { type: string }
+        meta: { type: object, additionalProperties: true }
+
+    Case:
+      type: object
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        lpa_code: { type: string }
+        reference: { type: string }
+
+    Site:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        geometry:
+          type: object
+          description: GeoJSON geometry in EPSG:4326 (WGS84). Server converts to EPSG:27700 internally and returns outputs in EPSG:4326.
+        crs:
+          type: string
+          enum: [EPSG:4326]
+          default: EPSG:4326
+        geometry_ref: { type: string }
+        uprn: { type: string }
+
+    Document:
+      type: object
+      required: [id, kind, uri]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        uri: { type: string, format: uri }
+        mime: { type: string }
+
+    Goal:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        target: { type: number, nullable: true }
+        weight: { type: number, default: 1.0 }
+
+    ConsultationItem:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        topic: { type: string }
+        text_ref: { type: string }
+
+    AssessmentEnvelope:
+      type: object
+      required: [schema, case, site]
+      properties:
+        schema: { type: string, example: "tpa.run/0.3" }
+        case: { $ref: '#/components/schemas/Case' }
+        site: { $ref: '#/components/schemas/Site' }
+        documents:
+          type: array
+          items: { $ref: '#/components/schemas/Document' }
+        policy_scope:
+          type: array
+          items: { type: string }
+        constraints_layers:
+          type: array
+          description: Must be registered layer slugs
+          items: { type: string }
+        goals:
+          type: array
+          items: { $ref: '#/components/schemas/Goal' }
+        consultation:
+          type: array
+          items: { $ref: '#/components/schemas/ConsultationItem' }
+        figures:
+          type: array
+          items: { type: object }
+        client_run_id:
+          type: string
+          description: Caller-supplied idempotent run id
+        options:
+          type: object
+          description: Feature flags, e.g. {"return_overlays": true, "vlm": false}
+          additionalProperties: true
+
+    PolicyFinding:
+      type: object
+      properties:
+        policy_id: { type: string }
+        title: { type: string }
+        rag: { type: string, enum: [red, amber, green, n/a] }
+        explanation: { type: string }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceLink' }
+        citations:
+          type: array
+          items: { type: string }
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+
+    SpatialFinding:
+      type: object
+      required: [layer, hit]
+      properties:
+        layer: { type: string }
+        hit: { type: boolean }
+        impact: { type: string, enum: [low, med, high] }
+        detail: { type: object, additionalProperties: true }
+        feature_ids: { type: array, items: { type: string } }
+        geometry:
+          type: object
+          description: Optional GeoJSON feature/union (EPSG:4326)
+        bbox:
+          type: array
+          description: [minx, miny, maxx, maxy] in EPSG:4326
+          items: { type: number }
+          minItems: 4
+          maxItems: 4
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceLink' }
+
+    ChecklistItem:
+      type: object
+      required: [item, status]
+      properties:
+        item: { type: string }
+        status: { type: string, enum: [pass, fail, n/a, needs_review] }
+        note: { type: string }
+
+    TraceStep:
+      type: object
+      required: [t]
+      properties:
+        t:
+          type: string
+          enum: [retrieve_policy, spatial_query, doc_parse, reason, report_map, overlay_emit, tool_execute]
+        at: { type: string, format: date-time }
+        tool: { type: string }
+        inputs_ref: { type: string }
+        outputs_ref: { type: string }
+        notes: { type: string }
+
+    KnowledgeBaseSnapshot:
+      type: object
+      properties:
+        corpus_version: { type: string }
+        policy_docs: { type: array, items: { type: string } }
+        spatial_registry: { type: string }
+
+    Trace:
+      type: object
+      required: [inputs_hash, steps]
+      properties:
+        inputs_hash: { type: string }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/TraceStep' }
+        model_ref: { type: string }
+        prompt_ref: { type: string }
+        kb_snapshot: { $ref: '#/components/schemas/KnowledgeBaseSnapshot' }
+        latency_ms: { type: integer }
+
+    Recommendation:
+      type: object
+      properties:
+        outcome: { type: string, enum: [approve, refuse, seek_changes, not_applicable] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+
+    ArtifactRef:
+      type: object
+      required: [type, uri]
+      properties:
+        type: { type: string, example: application/geo+json }
+        uri: { type: string, format: uri }
+        size_bytes: { type: integer }
+        meta: { type: object, additionalProperties: true }
+
+    AssessmentResult:
+      type: object
+      required: [trace]
+      properties:
+        recommendation: { $ref: '#/components/schemas/Recommendation' }
+        policies:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyFinding' }
+        spatial:
+          type: array
+          items: { $ref: '#/components/schemas/SpatialFinding' }
+        checklist:
+          type: array
+          items: { $ref: '#/components/schemas/ChecklistItem' }
+        draft_report_md: { type: string }
+        report_template_id: { type: string }
+        report_fields:
+          type: object
+          additionalProperties: { type: string }
+          description: Dot-keyed fields mapped to template sections
+        report_field_provenance:
+          type: object
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/EvidenceLink' }
+          description: Per-field provenance links (keys mirror report_fields)
+        artifacts:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/ArtifactRef' }
+          description: Named outputs; e.g., overlays_geojson → GeoJSON URI
+        trace: { $ref: '#/components/schemas/Trace' }

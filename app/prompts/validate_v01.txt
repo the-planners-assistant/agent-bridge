@@ -1,0 +1,1 @@
+Given case metadata and submitted documents, output JSON checklist with items: item,status,note.

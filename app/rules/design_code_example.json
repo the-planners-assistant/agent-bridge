@@ -1,0 +1,10 @@
+[
+  {
+    "id": "DC-H-01",
+    "when": {"zone": "frontage"},
+    "measure": "height_m",
+    "op": "<=",
+    "rhs": 11.0,
+    "cite": {"id":"ev-101","kind":"policy","uri":"s3://plans/design-code-2024.pdf","pointer":"#sec4.2/para3","hash":"sha256:...","captured_at":"2025-11-09T11:00:00Z"}
+  }
+]
